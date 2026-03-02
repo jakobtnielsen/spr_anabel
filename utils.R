@@ -1,0 +1,778 @@
+# =============================================================================
+# scripts/utils.R
+# Shared helper functions for the anabel SPR pipeline.
+# Sourced by run_SCA.R, run_MCK.R, run_SCK.R — do not run directly.
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(anabel)
+  library(ggplot2)
+  library(dplyr)
+  library(jsonlite)
+  library(writexl)
+  library(scales)
+  library(patchwork)
+})
+
+# ── Colour palette (publication-friendly, colorblind-safe) ────────────────────
+PALETTE <- c(
+  "#0072B2", "#E69F00", "#56B4E9", "#009E73",
+  "#F0E442", "#D55E00", "#CC79A7", "#999999"
+)
+
+# ── CLI option list shared across all three wrappers ──────────────────────────
+shared_options <- function(mode_default) {
+  list(
+    optparse::make_option("--input",      type = "character", default = NULL,
+      help = "Input CSV path. Omit to use built-in benchmark dataset."),
+    optparse::make_option("--conc",       type = "character", default = NULL,
+      help = "Comma-separated analyte concentrations, e.g. '50,16.7,5.56'"),
+    optparse::make_option("--conc_unit",  type = "character", default = "nM",
+      help = "Concentration unit: nM | uM | mM | pM [default: %default]"),
+    optparse::make_option("--tass",       type = "character", default = NULL,
+      help = "Association start time(s). Single value (SCA/MCK) or comma list (SCK)."),
+    optparse::make_option("--tdiss",      type = "character", default = NULL,
+      help = "Dissociation start time(s)."),
+    optparse::make_option("--tstart",     type = "double",    default = NA,
+      help = "Experiment start time [default: auto]"),
+    optparse::make_option("--tend",       type = "double",    default = NA,
+      help = "Experiment end time [default: auto]"),
+    optparse::make_option("--drift",      action = "store_true", default = FALSE,
+      help = "Enable linear drift correction"),
+    optparse::make_option("--decay",      action = "store_true", default = FALSE,
+      help = "Enable exponential decay correction"),
+    optparse::make_option("--label",      type = "character", default = NULL,
+      help = "Label prefix for output files [default: timestamp]"),
+    optparse::make_option("--outdir",     type = "character", default = NULL,
+      help = paste0("Output directory [default: output/", mode_default, "]"))
+  )
+}
+
+# ── Safe argument parsing (works when sourced or run via Rscript) ─────────────
+safe_parse <- function(option_list, description = "") {
+  # Pre-collect dest names and defaults (including NULLs)
+  dests    <- sapply(option_list, function(o) slot(o, "dest"))
+  defaults <- lapply(option_list, function(o) slot(o, "default"))
+  names(defaults) <- dests
+
+  result <- tryCatch(
+    optparse::parse_args(
+      optparse::OptionParser(option_list = option_list, description = description)
+    ),
+    error = function(e) defaults
+  )
+
+  # optparse drops NULL-default options from the result, which causes R's $
+  # partial-matching to return wrong values (e.g. opt$conc -> opt$conc_unit).
+  # Ensure every expected key is present, even when its value is NULL.
+  for (nm in setdiff(dests, names(result))) {
+    result[nm] <- list(defaults[[nm]])
+  }
+  result
+}
+
+# ── Load input data ───────────────────────────────────────────────────────────
+load_data <- function(path, mode) {
+  if (is.null(path)) {
+    ds_name <- switch(mode,
+      SCA = "SCA_dataset",
+      MCK = "MCK_dataset",
+      SCK = "SCK_dataset"
+    )
+    bench_path <- file.path("data", "benchmark", paste0(ds_name, ".csv"))
+    if (file.exists(bench_path)) {
+      cat("  Input : benchmark CSV →", bench_path, "\n")
+      return(read.csv(bench_path, stringsAsFactors = FALSE))
+    }
+    cat("  Input : built-in anabel dataset →", ds_name, "\n")
+    env <- new.env()
+    data(list = ds_name, package = "anabel", envir = env)
+    return(get(ds_name, envir = env))
+  }
+  if (!file.exists(path)) stop("Input file not found: ", path)
+  ext <- tolower(tools::file_ext(path))
+  cat("  Input :", path, "\n")
+  if (ext == "csv")  return(read.csv(path, stringsAsFactors = FALSE))
+  if (ext %in% c("tsv","txt")) return(read.delim(path, stringsAsFactors = FALSE))
+  if (ext == "xlsx") {
+    if (!requireNamespace("readxl", quietly = TRUE))
+      install.packages("readxl", repos = "https://cloud.r-project.org", quiet = TRUE)
+    return(readxl::read_xlsx(path))
+  }
+  stop("Unsupported format: ", ext)
+}
+
+# ── Parse concentration string → molar vector ────────────────────────────────
+parse_conc <- function(conc_str, conc_unit, mode) {
+  defaults <- list(
+    SCA = list(vals = 50,                              unit = "nM"),
+    MCK = list(vals = c(50, 16.7, 5.56, 1.85, 0.617), unit = "nM"),
+    SCK = list(vals = c(0.617, 1.85, 5.56, 16.7, 50), unit = "nM")
+  )
+  if (is.null(conc_str)) {
+    d <- defaults[[mode]]
+    cat("  Conc  : benchmark defaults:", paste(d$vals, collapse = ", "), d$unit, "\n")
+    return(convert_toMolar(val = d$vals, unit = d$unit))
+  }
+  vals <- as.numeric(trimws(strsplit(conc_str, ",")[[1]]))
+  cat("  Conc  :", paste(vals, collapse = ", "), conc_unit, "\n")
+  convert_toMolar(val = vals, unit = conc_unit)
+}
+
+# ── Global SCA fitter: three-step fully analytical ────────────────────────────
+# Avoids numerical optimisation entirely — no local-minimum traps.
+#
+# Step 1: kd per curve from dissociation log-linear regression; take median.
+# Step 2: kobs per curve from association log-linearisation:
+#           log(1 - R(t)/Req) = -kobs*(t-tass)   [linear through origin]
+#         Req is estimated as the median signal in the last 30 s before tdiss.
+# Step 3: ka = (kobs - kd) / [A]  per curve; take median.
+#         Rmax = Req / ([A] / ([A] + kd/ka))  per curve.
+fit_sca_global <- function(df, conc_M, tass, tdiss, tstart, tend) {
+  time_col <- grep("time", names(df), ignore.case = TRUE)[1]
+  tt_all   <- df[[time_col]]
+  resp_nms <- setdiff(names(df), names(df)[time_col])
+
+  keep   <- tt_all >= tstart & tt_all <= tend
+  tt     <- tt_all[keep]
+  Y_list <- lapply(resp_nms, function(nm) df[[nm]][keep])
+  n      <- length(Y_list)
+
+  # ── Step 1: kd from dissociation log-linear regression ─────────────────────
+  kd_per_curve <- sapply(Y_list, function(Y) {
+    mask <- tt > tdiss
+    t_d  <- tt[mask] - tdiss
+    R_d  <- Y[mask]
+    pos  <- R_d > 0.05 * max(R_d, na.rm = TRUE)
+    if (sum(pos) < 5) return(NA_real_)
+    fit  <- lm(log(R_d[pos]) ~ t_d[pos])
+    max(-coef(fit)[2], 1e-6)
+  })
+  kd_fixed <- median(kd_per_curve, na.rm = TRUE)
+  cat(sprintf("  kd per curve: %s\n",
+    paste(sprintf("%.5f", kd_per_curve), collapse = ", ")))
+  cat(sprintf("  kd fixed (median) = %.5f s-1\n", kd_fixed))
+
+  # ── Detect per-curve binding onset (handles dead-volume delays) ─────────────
+  # Baseline noise is estimated from t < tass; onset = first time after tass
+  # where signal exceeds baseline_mean + 3*baseline_sd for ≥2 consecutive points.
+  detect_onset <- function(Y) {
+    base_mask <- tt < tass
+    if (sum(base_mask) < 3) return(tass)
+    b_mean <- mean(Y[base_mask], na.rm = TRUE)
+    b_sd   <- sd(Y[base_mask], na.rm = TRUE)
+    thresh  <- b_mean + 3 * max(b_sd, 0.01)  # floor sd at 0.01 RU
+
+    post_mask <- tt > tass & tt < tdiss
+    tt_post   <- tt[post_mask]
+    Y_post    <- Y[post_mask]
+    above     <- Y_post > thresh
+    # Find first run of ≥2 consecutive TRUE values
+    for (i in seq_len(length(above) - 1)) {
+      if (above[i] && above[i + 1]) return(tt_post[i])
+    }
+    tass   # fallback: no clear onset found
+  }
+
+  # ── Step 2: profile over kobs; Req is OLS-analytic for each candidate ────────
+  # Model: R(t) = Req * f(t),  f(t) = 1 - exp(-kobs*(t - tass_eff))
+  # For fixed kobs, best Req = Σ(R·f) / Σ(f²)  [closed-form OLS].
+  # Reduces the 2-parameter problem to a stable 1D scalar optimisation.
+  per_curve <- lapply(Y_list, function(Y) {
+    tass_eff   <- detect_onset(Y)
+    assoc_mask <- tt >= tass_eff & tt <= tdiss
+    t_assoc    <- tt[assoc_mask] - tass_eff
+    R_assoc    <- Y[assoc_mask]
+
+    ss_kobs <- function(kobs) {
+      f   <- 1 - exp(-kobs * t_assoc)
+      Req <- sum(R_assoc * f, na.rm = TRUE) / sum(f^2, na.rm = TRUE)
+      sum((R_assoc - Req * f)^2, na.rm = TRUE)
+    }
+
+    # Search kobs from just above kd to 200*kd (very broad range)
+    kobs_upper <- max(kd_fixed * 200, 2 / max(t_assoc))
+    opt  <- optimize(ss_kobs, interval = c(kd_fixed, kobs_upper), tol = 1e-10)
+    kobs <- opt$minimum
+    f    <- 1 - exp(-kobs * t_assoc)
+    Req  <- sum(R_assoc * f, na.rm = TRUE) / sum(f^2, na.rm = TRUE)
+    list(kobs = kobs, Req = max(Req, 0), tass_eff = tass_eff)
+  })
+
+  kobs_per_curve  <- sapply(per_curve, `[[`, "kobs")
+  Req_per_curve   <- sapply(per_curve, `[[`, "Req")
+  tass_eff_curves <- sapply(per_curve, `[[`, "tass_eff")
+  cat(sprintf("  tass_eff per curve: %s\n",
+    paste(sprintf("%.0f", tass_eff_curves), collapse = ", ")))
+  cat(sprintf("  kobs per curve: %s\n",
+    paste(sprintf("%.5f", kobs_per_curve), collapse = ", ")))
+
+  # ── Step 3: ka = (kobs - kd) / [A]; Rmax from Req ──────────────────────────
+  ka_per_curve   <- pmax((kobs_per_curve - kd_fixed) / conc_M, 1)
+  ka             <- median(ka_per_curve, na.rm = TRUE)
+  KD             <- kd_fixed / ka
+  Rmax_per_curve <- Req_per_curve / (conc_M / (conc_M + KD))
+  cat(sprintf("  ka per curve: %s M-1s-1\n",
+    paste(sprintf("%.3e", ka_per_curve), collapse = ", ")))
+
+  list(
+    ka          = ka,
+    kd          = kd_fixed,
+    kd_curves   = kd_per_curve,
+    kobs_curves = kobs_per_curve,
+    ka_curves   = ka_per_curve,
+    KD          = KD,
+    KD_nM       = KD * 1e9,
+    Rmax        = setNames(Rmax_per_curve, resp_nms),
+    converged   = TRUE,
+    rss         = NA_real_
+  )
+}
+
+# ── Custom SCK global fitter: data-driven R₀ + per-cycle onset detection ─────
+#
+# Improvement 1 — Data-driven initial conditions per cycle
+#   R₀(n) is read directly from the observed signal in the last 5 s before each
+#   injection tass_n — model-independent and physically exact. This eliminates
+#   both error propagation and the bias introduced by dead-volume delays.
+#
+# Improvement 2 — Per-cycle onset detection (dead-volume correction)
+#   SPR instruments have a dead-volume delay (~40 s on Biacore) between the
+#   nominal tass and when analyte actually reaches the chip. During this period
+#   the signal continues to dissociate. detect_onset_sck() finds tass_eff_n
+#   from a sustained positive slope, then the dead-volume window
+#   [tass_n, tass_eff_n] is modelled as pure dissociation so the association
+#   phase starts at the correct time with the correct initial condition.
+#
+# Improvement 3 — RI transient masking
+#   Points within ri_window seconds of each tass_n, tdiss_n, and tass_eff_n
+#   are excluded to prevent refractive-index spikes from biasing ka.
+#
+# Outer optimisation: minpack.lm nls.lm over only 3 global params (ka, kd, Rmax).
+fit_sck_global <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
+                           ri_window = 3) {
+  require(minpack.lm)
+
+  time_col <- grep("time", names(df), ignore.case = TRUE)[1]
+  tt_all   <- df[[time_col]]
+  resp_nm  <- setdiff(names(df), names(df)[time_col])[1]
+
+  keep <- tt_all >= tstart & tt_all <= tend
+  tt   <- tt_all[keep]
+  Y    <- df[[resp_nm]][keep]
+
+  n_cycles <- length(tass_vec)
+
+  # ── R₀_n from data: signal just before each injection ─────────────────────
+  # Mean of points in [tass_n - 5, tass_n).  Model-independent; represents the
+  # true residual complex signal at the moment the flow switches to analyte.
+  R0_init <- sapply(seq_len(n_cycles), function(n) {
+    pre <- tt >= (tass_vec[n] - 5) & tt < tass_vec[n] & !is.na(Y)
+    if (sum(pre) == 0) return(0)
+    mean(Y[pre], na.rm = TRUE)
+  })
+  R0_init <- pmax(R0_init, 0)   # clamp to non-negative
+  cat(sprintf("  R\u2080 from data : %s RU\n",
+              paste(sprintf("%.3f", R0_init), collapse = ", ")))
+
+  # ── Per-cycle onset detection ─────────────────────────────────────────────
+  # Finds when analyte actually arrives after the dead-volume delay.
+  # Looks for a sustained positive slope (≥ 2 consecutive 5-point windows
+  # with slope > 3 * noise_sd / 5 s, i.e. rising faster than noise).
+  detect_onset_sck <- function(n) {
+    start <- tass_vec[n] + ri_window
+    post  <- tt > start & tt < tdiss_vec[n]
+    tt_p  <- tt[post];  Y_p <- Y[post]
+    if (length(Y_p) < 6) return(start)
+
+    # Adaptive slope threshold from pre-injection noise
+    pre_pts <- tt >= (tass_vec[n] - 10) & tt < tass_vec[n]
+    noise   <- if (sum(pre_pts) >= 3) sd(Y[pre_pts], na.rm = TRUE) else 0.05
+    noise   <- max(noise, 0.01)
+    sl_thr  <- 3 * noise / 5   # RU/s over a 5-s window
+
+    consec <- 0L
+    for (i in seq_len(length(Y_p) - 4L)) {
+      sl <- (Y_p[i + 4L] - Y_p[i]) / (tt_p[i + 4L] - tt_p[i])
+      if (sl > sl_thr) {
+        consec <- consec + 1L
+        if (consec >= 2L) return(tt_p[i])
+      } else {
+        consec <- 0L
+      }
+    }
+    start   # fallback: no clear onset found
+  }
+
+  tass_eff_vec <- sapply(seq_len(n_cycles), detect_onset_sck)
+  cat(sprintf("  tass_eff     : %s s\n",
+              paste(sprintf("%.0f", tass_eff_vec), collapse = ", ")))
+
+  # ── RI transient mask ─────────────────────────────────────────────────────
+  ri_mask <- rep(TRUE, length(tt))
+  for (n in seq_len(n_cycles)) {
+    ri_mask[tt >= tass_vec[n]     & tt < tass_vec[n]     + ri_window] <- FALSE
+    ri_mask[tt >= tdiss_vec[n]    & tt < tdiss_vec[n]    + ri_window] <- FALSE
+    ri_mask[tt >= tass_eff_vec[n] & tt < tass_eff_vec[n] + ri_window] <- FALSE
+  }
+  cat(sprintf("  RI mask      : %d / %d points excluded\n",
+              sum(!ri_mask), length(tt)))
+
+  # ── Full model prediction ─────────────────────────────────────────────────
+  # Per-cycle structure:
+  #   [tass_n,     tass_eff_n): pure dissociation from R0_init[n]
+  #                              (dead-volume; analyte not yet at chip)
+  #   [tass_eff_n, tdiss_n]  : 1:1 Langmuir association from R0_eff_n
+  #                              where R0_eff_n = R0_init[n]*exp(-kd*delay_n)
+  #   (tdiss_n,    t_end_n]  : dissociation from R_end_n
+  sck_pred <- function(ka, kd, Rmax) {
+    KD     <- kd / ka
+    R_pred <- rep(NA_real_, length(tt))
+
+    for (n in seq_len(n_cycles)) {
+      kobs_n   <- ka * conc_M[n] + kd
+      Req_n    <- Rmax * conc_M[n] / (conc_M[n] + KD)
+      R0_n     <- R0_init[n]
+      delay_n  <- tass_eff_vec[n] - tass_vec[n]
+      R0_eff_n <- R0_n * exp(-kd * delay_n)
+      t_end_n  <- if (n < n_cycles) tass_vec[n + 1] else tend
+
+      # Dead-volume: pure dissociation
+      dv_mask <- tt >= tass_vec[n] & tt < tass_eff_vec[n]
+      if (any(dv_mask)) {
+        R_pred[dv_mask] <- R0_n * exp(-kd * (tt[dv_mask] - tass_vec[n]))
+      }
+
+      # Association from tass_eff_n
+      a_mask <- tt >= tass_eff_vec[n] & tt <= tdiss_vec[n]
+      if (any(a_mask)) {
+        dt_a <- tt[a_mask] - tass_eff_vec[n]
+        R_pred[a_mask] <- Req_n + (R0_eff_n - Req_n) * exp(-kobs_n * dt_a)
+      }
+
+      # Signal at end of association
+      R_end_n <- Req_n + (R0_eff_n - Req_n) *
+                 exp(-kobs_n * (tdiss_vec[n] - tass_eff_vec[n]))
+
+      # Dissociation
+      d_mask <- tt > tdiss_vec[n] & tt <= t_end_n
+      if (any(d_mask)) {
+        R_pred[d_mask] <- R_end_n * exp(-kd * (tt[d_mask] - tdiss_vec[n]))
+      }
+    }
+    R_pred
+  }
+
+  # ── Residual function for outer LM optimiser ─────────────────────────────
+  resid_fn <- function(p) {
+    ka <- p[["ka"]];  kd <- p[["kd"]];  Rmax <- p[["Rmax"]]
+    if (any(c(ka, kd, Rmax) <= 0)) return(rep(1e6, sum(ri_mask)))
+    R_pred <- sck_pred(ka, kd, Rmax)
+    valid  <- ri_mask & !is.na(R_pred)
+    Y[valid] - R_pred[valid]
+  }
+
+  # ── Initial estimates ─────────────────────────────────────────────────────
+  kd_init <- tryCatch({
+    mask <- tt > tdiss_vec[n_cycles] & ri_mask
+    t_d  <- tt[mask] - tdiss_vec[n_cycles];  R_d <- Y[mask]
+    pos  <- R_d > 0.05 * max(R_d, na.rm = TRUE) & t_d > 0
+    if (sum(pos) < 5) return(0.01)
+    max(-coef(lm(log(R_d[pos]) ~ t_d[pos]))[2], 1e-4)
+  }, error = function(e) 0.01)
+
+  KD_guess  <- kd_init / 1e6
+  sat_frac  <- max(conc_M) / (max(conc_M) + KD_guess)
+  Rmax_init <- max(Y, na.rm = TRUE) / sat_frac
+  ka_init   <- kd_init / KD_guess
+
+  p0 <- c(ka = ka_init, kd = kd_init, Rmax = Rmax_init)
+  lb <- c(ka = 1,       kd = 1e-6,    Rmax = 0.01)
+
+  cat(sprintf("  Init         : ka=%.2e  kd=%.4f  Rmax=%.2f\n",
+              ka_init, kd_init, Rmax_init))
+
+  fit <- minpack.lm::nls.lm(
+    par     = p0,
+    fn      = resid_fn,
+    lower   = lb,
+    control = minpack.lm::nls.lm.control(maxiter = 1000, ftol = 1e-12, ptol = 1e-12)
+  )
+
+  p    <- fit$par
+  ka   <- p[["ka"]];  kd <- p[["kd"]];  Rmax <- p[["Rmax"]]
+  KD   <- kd / ka
+  R_pred_full <- sck_pred(ka, kd, Rmax)
+
+  list(
+    ka          = ka,
+    kd          = kd,
+    Rmax        = Rmax,
+    KD          = KD,
+    KD_nM       = KD * 1e9,
+    R0_cycles   = R0_init,       # data-derived, physically meaningful
+    tass_eff    = tass_eff_vec,
+    converged   = fit$info %in% 1:4,
+    rss         = sum(fit$fvec^2),
+    # time series for plotting
+    tt          = tt,
+    Y           = Y,
+    R_pred      = R_pred_full
+  )
+}
+
+# ── Plot: SCK custom global fit overlay ───────────────────────────────────────
+# Shows raw data, custom fit curve, and injection boundaries.
+plot_sck_custom_fit <- function(gfit, conc_M, tass_vec, tdiss_vec) {
+  df <- data.frame(
+    Time     = gfit$tt,
+    Response = gfit$Y,
+    Fit      = gfit$R_pred
+  )
+  # Fill pre-first-injection baseline with 0
+  df$Fit[is.na(df$Fit)] <- 0
+
+  conc_nM <- round(conc_M * 1e9, 3)
+
+  # Build boundary annotation layers
+  tass_df     <- data.frame(x = tass_vec,     label = paste0(conc_nM, " nM"))
+  tass_eff_df <- data.frame(x = gfit$tass_eff)
+  tdiss_df    <- data.frame(x = tdiss_vec)
+
+  subtitle_txt <- sprintf(
+    "ka = %.3e M\u207b\u00b9s\u207b\u00b9  |  kd = %.4f s\u207b\u00b9  |  K\u1d05 = %.2f nM  |  Rmax = %.2f RU  |  RSS = %.2f",
+    gfit$ka, gfit$kd, gfit$KD_nM, gfit$Rmax, gfit$rss
+  )
+
+  ggplot(df, aes(x = Time)) +
+    # Nominal injection start (solid grey)
+    geom_vline(data = tass_df, aes(xintercept = x),
+               colour = "grey60", linetype = "solid", linewidth = 0.4) +
+    # Effective onset (dashed blue) — where analyte actually arrives
+    geom_vline(data = tass_eff_df, aes(xintercept = x),
+               colour = PALETTE[1], linetype = "dashed", linewidth = 0.5) +
+    # Dissociation start (solid grey)
+    geom_vline(data = tdiss_df, aes(xintercept = x),
+               colour = "grey60", linetype = "solid", linewidth = 0.4) +
+    # Raw data
+    geom_point(aes(y = Response), size = 0.5, alpha = 0.4, colour = "grey50", shape = 16) +
+    # Custom fit
+    geom_line(aes(y = Fit), colour = PALETTE[2], linewidth = 1.0) +
+    # Concentration labels at tass
+    geom_text(data = tass_df, aes(x = x, label = label),
+              y = Inf, vjust = 1.4, hjust = -0.05, size = 2.8, colour = "grey40") +
+    labs(
+      title    = "SCK — Custom global fit (data-driven R\u2080 + onset detection)",
+      subtitle = subtitle_txt,
+      x        = "Time (s)",
+      y        = "Response (RU)",
+      caption  = "Grey verticals: nominal tass / tdiss  |  Blue dashed: effective analyte onset (tass\u1d07\u1da0\u1da0)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 8,  colour = "grey30"),
+      plot.caption  = element_text(size = 7.5, colour = "grey50"),
+      panel.grid.minor  = element_blank(),
+      panel.border      = element_rect(colour = "grey80", fill = NA)
+    )
+}
+
+# ── Parse time parameter (single value or comma-separated vector) ─────────────
+parse_time <- function(t_str, mode_default) {
+  if (is.null(t_str)) return(mode_default)
+  vals <- as.numeric(trimws(strsplit(as.character(t_str), ",")[[1]]))
+  if (length(vals) == 1) return(vals)
+  return(vals)
+}
+
+# ── Enrich kinetics table with derived columns ────────────────────────────────
+enrich_kinetics <- function(kt, conc_M) {
+  kt <- as.data.frame(kt)
+
+  # Add concentration column if missing
+  if (!"conc_M" %in% names(kt) && length(conc_M) >= 1) {
+    # Try to match rows to concentrations
+    if (nrow(kt) == length(conc_M)) {
+      kt$conc_M <- conc_M
+    } else {
+      kt$conc_M <- conc_M[1]  # SCA single concentration
+    }
+  }
+
+  # Extract ka / kd with flexible column name matching
+  ka_col <- intersect(c("ka","kon","Ka","Kon","kass","kass"), names(kt))[1]
+  kd_col <- intersect(c("kd","koff","Kd","Koff","kdiss"), names(kt))[1]
+  KD_col <- intersect(c("KD","Kd_eq","kd_eq","KD_fit"), names(kt))[1]
+
+  if (!is.na(ka_col) && !is.na(kd_col)) {
+    ka <- suppressWarnings(as.numeric(kt[[ka_col]]))
+    kd <- suppressWarnings(as.numeric(kt[[kd_col]]))
+
+    if (!is.na(KD_col)) {
+      KD <- suppressWarnings(as.numeric(kt[[KD_col]]))
+    } else {
+      KD <- kd / ka
+    }
+
+    kt$KD_nM            <- KD * 1e9
+    kt$residence_time_s <- 1 / kd
+    kt$residence_time_min <- kt$residence_time_s / 60
+  }
+  kt
+}
+
+# ── Save all output artefacts ─────────────────────────────────────────────────
+save_outputs <- function(result, enriched_kt, mode, label, outdir, conc_M,
+                         tass, tdiss, opt) {
+
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+  # 1. Kinetics table — CSV
+  kt_csv <- file.path(outdir, paste0(mode, "_", label, "_kinetics.csv"))
+  write.csv(enriched_kt, kt_csv, row.names = FALSE)
+  cat("  →  Kinetics CSV   :", kt_csv, "\n")
+
+  # 2. Kinetics table — Excel
+  kt_xlsx <- file.path(outdir, paste0(mode, "_", label, "_kinetics.xlsx"))
+  writexl::write_xlsx(enriched_kt, kt_xlsx)
+  cat("  →  Kinetics XLSX  :", kt_xlsx, "\n")
+
+  # 3. Full fit curves — CSV
+  if (!is.null(result$fit_data)) {
+    fc_csv <- file.path(outdir, paste0(mode, "_", label, "_fit_curves.csv"))
+    write.csv(result$fit_data, fc_csv, row.names = FALSE)
+    cat("  →  Fit curves CSV :", fc_csv, "\n")
+  }
+
+  # 4. JSON summary
+  summary_obj <- list(
+    mode            = mode,
+    label           = label,
+    timestamp       = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+    input           = if (is.null(opt$input)) paste0("built-in:", mode, "_dataset") else opt$input,
+    concentrations  = list(values_M = as.list(conc_M), unit = "M"),
+    time_params     = list(tass = tass, tdiss = tdiss,
+                           tstart = opt$tstart, tend = opt$tend),
+    corrections     = list(drift = isTRUE(opt$drift), decay = isTRUE(opt$decay)),
+    kinetics        = as.list(enriched_kt)
+  )
+  json_path <- file.path(outdir, paste0(mode, "_", label, "_summary.json"))
+  writeLines(toJSON(summary_obj, pretty = TRUE, auto_unbox = TRUE), json_path)
+  cat("  →  JSON summary   :", json_path, "\n")
+
+  # 5. Plots
+  plots_saved <- make_plots(result, enriched_kt, mode, label, outdir, conc_M)
+
+  invisible(list(kt_csv = kt_csv, json = json_path, plots = plots_saved))
+}
+
+# ── Plot factory ──────────────────────────────────────────────────────────────
+make_plots <- function(result, enriched_kt, mode, label, outdir, conc_M) {
+  saved <- c()
+
+  # — Sensorgram + fit overlay ————————————————————————————————
+  p_sensor <- plot_sensorgram(result$fit_data, mode, conc_M)
+  sensor_path <- file.path(outdir, paste0(mode, "_", label, "_sensorgram.png"))
+  ggsave(sensor_path, p_sensor, width = 9, height = 5.5, dpi = 300, bg = "white")
+  cat("  →  Sensorgram PNG :", sensor_path, "\n")
+  saved <- c(saved, sensor_path)
+
+  # — Residuals ———————————————————————————————————————————————
+  p_resid <- plot_residuals(result$fit_data, mode)
+  resid_path <- file.path(outdir, paste0(mode, "_", label, "_residuals.png"))
+  ggsave(resid_path, p_resid, width = 9, height = 3.5, dpi = 300, bg = "white")
+  cat("  →  Residuals PNG  :", resid_path, "\n")
+  saved <- c(saved, resid_path)
+
+  # — kobs linearisation (MCK only) ———————————————————————————
+  if (mode == "MCK") {
+    p_kobs <- plot_kobs(enriched_kt, conc_M)
+    if (!is.null(p_kobs)) {
+      kobs_path <- file.path(outdir, paste0(mode, "_", label, "_kobs_plot.png"))
+      ggsave(kobs_path, p_kobs, width = 6, height = 5, dpi = 300, bg = "white")
+      cat("  →  kobs plot PNG  :", kobs_path, "\n")
+      saved <- c(saved, kobs_path)
+    }
+  }
+
+  # — KD summary bar (if multiple curves) ———————————————————————
+  ka_col <- intersect(c("ka","kon","Ka","Kon"), names(enriched_kt))[1]
+  if (!is.na(ka_col) && nrow(enriched_kt) > 1) {
+    p_kd <- plot_kd_summary(enriched_kt)
+    if (!is.null(p_kd)) {
+      kd_path <- file.path(outdir, paste0(mode, "_", label, "_KD_summary.png"))
+      ggsave(kd_path, p_kd, width = 6, height = 4, dpi = 300, bg = "white")
+      cat("  →  KD summary PNG :", kd_path, "\n")
+      saved <- c(saved, kd_path)
+    }
+  }
+
+  invisible(saved)
+}
+
+# ── Plot: sensorgram with fit overlay ─────────────────────────────────────────
+plot_sensorgram <- function(fit_data, mode, conc_M) {
+  if (is.null(fit_data)) {
+    return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No fit data") +
+             theme_void())
+  }
+  df <- as.data.frame(fit_data)
+
+  # Detect group/name column
+  grp_col <- intersect(c("Name","name","Sample","sample","Curve"), names(df))[1]
+  if (is.na(grp_col)) { df$Group <- "Curve"; grp_col <- "Group" }
+
+  # Detect response column
+  resp_col <- intersect(c("Response","response","Resp","RU"), names(df))[1]
+  if (is.na(resp_col)) resp_col <- names(df)[2]
+
+  # Detect fit column
+  fit_col <- intersect(c("fit","Fit","model","Model"), names(df))[1]
+
+  # Concentration label for legend
+  conc_nM <- round(conc_M * 1e9, 2)
+  groups   <- unique(df[[grp_col]])
+  if (length(conc_nM) == length(groups)) {
+    lbl_map <- setNames(paste0(conc_nM, " nM"), groups)
+    df$ConcentrationLabel <- lbl_map[as.character(df[[grp_col]])]
+  } else {
+    df$ConcentrationLabel <- df[[grp_col]]
+  }
+
+  p <- ggplot(df, aes(x = Time, colour = ConcentrationLabel)) +
+    geom_point(aes(y = .data[[resp_col]]), size = 0.6, alpha = 0.5, shape = 16) +
+    scale_colour_manual(values = PALETTE, name = "Concentration") +
+    labs(
+      title    = paste0(mode, " — Sensorgram with 1:1 Langmuir fit"),
+      subtitle = "Points = raw response (RU); line = model fit",
+      x        = "Time (s)",
+      y        = "Response (RU)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      legend.position = "right",
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "grey80", fill = NA)
+    )
+
+  if (!is.na(fit_col)) {
+    p <- p + geom_line(aes(y = .data[[fit_col]]), linewidth = 0.9)
+  }
+  p
+}
+
+# ── Plot: residuals ───────────────────────────────────────────────────────────
+plot_residuals <- function(fit_data, mode) {
+  if (is.null(fit_data)) return(NULL)
+  df <- as.data.frame(fit_data)
+
+  resp_col <- intersect(c("Response","response","Resp","RU"), names(df))[1]
+  fit_col  <- intersect(c("fit","Fit","model","Model"), names(df))[1]
+  grp_col  <- intersect(c("Name","name","Sample","sample","Curve"), names(df))[1]
+
+  if (is.na(resp_col) || is.na(fit_col)) return(NULL)
+
+  df$Residual <- df[[resp_col]] - df[[fit_col]]
+  if (is.na(grp_col)) { df$Group <- "Curve"; grp_col <- "Group" }
+
+  ggplot(df, aes(x = Time, y = Residual, colour = .data[[grp_col]])) +
+    geom_line(linewidth = 0.5, alpha = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    scale_colour_manual(values = PALETTE, guide = "none") +
+    facet_wrap(~.data[[grp_col]], scales = "free_y", ncol = 3) +
+    labs(
+      title = paste0(mode, " — Residuals (data − fit)"),
+      x = "Time (s)", y = "Residual (RU)"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.border = element_rect(colour = "grey80", fill = NA),
+      strip.text = element_text(size = 8)
+    )
+}
+
+# ── Plot: kobs linearisation (MCK only) ──────────────────────────────────────
+plot_kobs <- function(enriched_kt, conc_M) {
+  kobs_col <- intersect(c("kobs","Kobs","k_obs"), names(enriched_kt))[1]
+  if (is.na(kobs_col)) return(NULL)
+
+  df <- data.frame(
+    conc_M = conc_M,
+    kobs   = suppressWarnings(as.numeric(enriched_kt[[kobs_col]]))
+  )
+  df <- df[!is.na(df$kobs), ]
+  if (nrow(df) < 2) return(NULL)
+
+  fit  <- lm(kobs ~ conc_M, data = df)
+  ka_est <- coef(fit)[2]
+  kd_est <- coef(fit)[1]
+  r2 <- summary(fit)$r.squared
+
+  ggplot(df, aes(x = conc_M * 1e9, y = kobs)) +
+    geom_point(size = 3, colour = PALETTE[1]) +
+    geom_smooth(method = "lm", se = TRUE, colour = PALETTE[2], fill = PALETTE[2],
+                alpha = 0.15, linewidth = 0.9) +
+    scale_x_continuous(labels = scales::label_number(suffix = " nM", scale = 1)) +
+    labs(
+      title    = "MCK — kobs linearisation",
+      subtitle = sprintf("Slope = ka = %.2e M⁻¹s⁻¹  |  Intercept = kd = %.4f s⁻¹  |  R² = %.4f",
+                         ka_est, kd_est, r2),
+      x = "Analyte concentration (nM)",
+      y = expression(k[obs]~(s^{-1}))
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold"),
+      plot.subtitle = element_text(size = 9, colour = "grey40"),
+      panel.border  = element_rect(colour = "grey80", fill = NA)
+    )
+}
+
+# ── Plot: K_D summary bar chart ───────────────────────────────────────────────
+plot_kd_summary <- function(enriched_kt) {
+  if (!"KD_nM" %in% names(enriched_kt)) return(NULL)
+  df <- enriched_kt[!is.na(enriched_kt$KD_nM), , drop = FALSE]
+  if (nrow(df) < 1) return(NULL)
+
+  # Use sample name if available
+  nm_col <- intersect(c("sample","Sample","Name","name"), names(df))[1]
+  if (is.na(nm_col)) df$Label <- seq_len(nrow(df)) else df$Label <- df[[nm_col]]
+
+  ggplot(df, aes(x = factor(Label), y = KD_nM, fill = factor(Label))) +
+    geom_col(width = 0.6, show.legend = FALSE) +
+    geom_text(aes(label = sprintf("%.2f nM", KD_nM)),
+              vjust = -0.4, size = 3.2, colour = "grey20") +
+    scale_fill_manual(values = PALETTE) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+    labs(
+      title = "K_D per sample",
+      x     = "Sample",
+      y     = expression(K[D]~(nM))
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title   = element_text(face = "bold"),
+      panel.border = element_rect(colour = "grey80", fill = NA)
+    )
+}
+
+# ── Console banner ────────────────────────────────────────────────────────────
+print_banner <- function(mode) {
+  cat("\n╔══════════════════════════════════════╗\n")
+  cat(sprintf("║  anabel SPR Pipeline — %-14s║\n", mode))
+  cat("╚══════════════════════════════════════╝\n\n")
+}
+
+print_kinetics_summary <- function(enriched_kt) {
+  cat("\n  ── Kinetics summary ─────────────────────────────────\n")
+  cols_show <- intersect(
+    c("sample","Sample","Name","ka","kass","kd","kdiss","KD","KD_nM",
+      "residence_time_s","residence_time_min","FittingQ"),
+    names(enriched_kt)
+  )
+  print(enriched_kt[, cols_show, drop = FALSE], row.names = FALSE)
+  cat("  ─────────────────────────────────────────────────────\n\n")
+}

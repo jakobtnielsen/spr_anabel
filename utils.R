@@ -478,6 +478,273 @@ plot_sck_custom_fit <- function(gfit, conc_M, tass_vec, tdiss_vec) {
     )
 }
 
+# ── Custom SCK fitter: shared dead-volume delay τ_dv ─────────────────────────
+#
+# Extends fit_sck_global() by replacing per-cycle onset detection with a single
+# shared dead-volume parameter τ_dv (4th free parameter, bounded 0–60 s).
+# For every cycle n:
+#   [tass_n,         tass_n  + τ_dv] : pure dissociation from R₀_n
+#   [tass_n + τ_dv,  tdiss_n + τ_dv] : 1:1 Langmuir association
+#   (tdiss_n + τ_dv, t_end_n]        : pure dissociation from R_end_n
+#
+# R₀_n: data-driven from [tass_n − 5, tass_n) — unchanged.
+# RI mask: nominal tass_n and tdiss_n only (no mask at effective onset times).
+# SE: estimated from the Gauss-Newton Hessian (J^T J) returned by nls.lm.
+fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
+                               ri_window = 3) {
+  require(minpack.lm)
+
+  time_col <- grep("time", names(df), ignore.case = TRUE)[1]
+  tt_all   <- df[[time_col]]
+  resp_nm  <- setdiff(names(df), names(df)[time_col])[1]
+
+  keep <- tt_all >= tstart & tt_all <= tend
+  tt   <- tt_all[keep]
+  Y    <- df[[resp_nm]][keep]
+  n_cycles <- length(tass_vec)
+
+  # R₀_n from data: mean signal in [tass_n − 5, tass_n)
+  R0_init <- pmax(sapply(seq_len(n_cycles), function(n) {
+    pre <- tt >= (tass_vec[n] - 5) & tt < tass_vec[n] & !is.na(Y)
+    if (sum(pre) == 0) return(0)
+    mean(Y[pre], na.rm = TRUE)
+  }), 0)
+  cat(sprintf("  R\u2080 from data : %s RU\n",
+              paste(sprintf("%.3f", R0_init), collapse = ", ")))
+
+  # RI mask at nominal tass_n and tdiss_n only
+  ri_mask <- rep(TRUE, length(tt))
+  for (n in seq_len(n_cycles)) {
+    ri_mask[tt >= tass_vec[n]  & tt < tass_vec[n]  + ri_window] <- FALSE
+    ri_mask[tt >= tdiss_vec[n] & tt < tdiss_vec[n] + ri_window] <- FALSE
+  }
+  cat(sprintf("  RI mask      : %d / %d points excluded\n",
+              sum(!ri_mask), length(tt)))
+
+  # ── Model prediction ────────────────────────────────────────────────────────
+  sck_pred_dv <- function(ka, kd, Rmax, tau_dv) {
+    KD     <- kd / ka
+    R_pred <- rep(NA_real_, length(tt))
+    for (n in seq_len(n_cycles)) {
+      kobs_n      <- ka * conc_M[n] + kd
+      Req_n       <- Rmax * conc_M[n] / (conc_M[n] + KD)
+      R0_n        <- R0_init[n]
+      R0_eff_n    <- R0_n * exp(-kd * tau_dv)
+      tass_eff_n  <- tass_vec[n]  + tau_dv
+      tdiss_eff_n <- tdiss_vec[n] + tau_dv
+      t_end_n     <- if (n < n_cycles) tass_vec[n + 1] else tend
+
+      # Dead-volume: pure dissociation from R₀_n
+      dv_mask <- tt >= tass_vec[n] & tt < tass_eff_n
+      if (any(dv_mask))
+        R_pred[dv_mask] <- R0_n * exp(-kd * (tt[dv_mask] - tass_vec[n]))
+
+      # Association: tass_eff_n → tdiss_eff_n
+      a_mask <- tt >= tass_eff_n & tt <= tdiss_eff_n
+      if (any(a_mask)) {
+        dt_a <- tt[a_mask] - tass_eff_n
+        R_pred[a_mask] <- Req_n + (R0_eff_n - Req_n) * exp(-kobs_n * dt_a)
+      }
+
+      # Signal at end of association (duration = tdiss_n − tass_n, shift cancels)
+      R_end_n <- Req_n + (R0_eff_n - Req_n) *
+                 exp(-kobs_n * (tdiss_vec[n] - tass_vec[n]))
+
+      # Dissociation: tdiss_eff_n → t_end_n
+      d_mask <- tt > tdiss_eff_n & tt <= t_end_n
+      if (any(d_mask))
+        R_pred[d_mask] <- R_end_n * exp(-kd * (tt[d_mask] - tdiss_eff_n))
+    }
+    R_pred
+  }
+
+  # ── Residual function ────────────────────────────────────────────────────────
+  resid_fn <- function(p) {
+    ka <- p[["ka"]]; kd <- p[["kd"]]; Rmax <- p[["Rmax"]]; tau_dv <- p[["tau_dv"]]
+    if (any(c(ka, kd, Rmax) <= 0) || tau_dv < 0) return(rep(1e6, sum(ri_mask)))
+    R_pred <- sck_pred_dv(ka, kd, Rmax, tau_dv)
+    valid  <- ri_mask & !is.na(R_pred)
+    Y[valid] - R_pred[valid]
+  }
+
+  # ── Initial estimates ────────────────────────────────────────────────────────
+  kd_init <- tryCatch({
+    mask <- tt > tdiss_vec[n_cycles] & ri_mask
+    t_d  <- tt[mask] - tdiss_vec[n_cycles];  R_d <- Y[mask]
+    pos  <- R_d > 0.05 * max(R_d, na.rm = TRUE) & t_d > 0
+    if (sum(pos) < 5) return(0.01)
+    max(-coef(lm(log(R_d[pos]) ~ t_d[pos]))[2], 1e-4)
+  }, error = function(e) 0.01)
+
+  KD_guess  <- kd_init / 1e6
+  sat_frac  <- max(conc_M) / (max(conc_M) + KD_guess)
+  Rmax_init <- max(Y, na.rm = TRUE) / sat_frac
+  ka_init   <- kd_init / KD_guess
+
+  p0 <- c(ka = ka_init, kd = kd_init, Rmax = Rmax_init, tau_dv = 15)
+  lb <- c(ka = 1,       kd = 1e-6,    Rmax = 0.01,      tau_dv =  0)
+  ub <- c(ka = Inf,     kd = Inf,     Rmax = Inf,        tau_dv = 60)
+
+  cat(sprintf("  Init         : ka=%.2e  kd=%.4f  Rmax=%.2f  tau_dv=15 s\n",
+              ka_init, kd_init, Rmax_init))
+
+  fit <- minpack.lm::nls.lm(
+    par     = p0,
+    fn      = resid_fn,
+    lower   = lb,
+    upper   = ub,
+    control = minpack.lm::nls.lm.control(maxiter = 1000, ftol = 1e-12, ptol = 1e-12)
+  )
+
+  p      <- fit$par
+  ka     <- p[["ka"]]; kd <- p[["kd"]]; Rmax <- p[["Rmax"]]; tau_dv <- p[["tau_dv"]]
+  KD     <- kd / ka
+  R_pred_full <- sck_pred_dv(ka, kd, Rmax, tau_dv)
+
+  # ── SE from Gauss-Newton Hessian ─────────────────────────────────────────────
+  # nls.lm returns fit$hessian ≈ J^T J (Hessian of 0.5·RSS).
+  # Cov(θ) ≈ σ²·(J^T J)^{-1},  σ² = RSS / (n_obs − n_par)
+  #
+  # Parameters span very different scales (ka~1e6 vs τ_dv~10), making J^T J
+  # ill-conditioned for direct inversion. We scale the Hessian by its diagonal,
+  # invert, then unscale. Falls back to SVD pseudoinverse on continued failure.
+  n_obs  <- sum(ri_mask & !is.na(R_pred_full))
+  n_par  <- length(p)
+  rss    <- sum(fit$fvec^2)
+  sigma2 <- rss / max(n_obs - n_par, 1L)
+
+  se_params <- tryCatch({
+    h     <- fit$hessian
+    sc    <- sqrt(pmax(diag(h), .Machine$double.eps))  # scale by sqrt-diagonal
+    h_sc  <- h / outer(sc, sc)                         # scaled Hessian
+    cov_m <- sigma2 * solve(h_sc) / outer(sc, sc)      # unscale covariance
+    sqrt(pmax(diag(cov_m), 0))
+  }, error = function(e) {
+    # Fallback: SVD pseudoinverse (handles near-rank-deficient case)
+    tryCatch({
+      svd_h <- svd(fit$hessian)
+      tol   <- max(svd_h$d) * .Machine$double.eps * n_par * 1e4
+      inv_d <- ifelse(svd_h$d > tol, 1 / svd_h$d, 0)
+      cov_m <- sigma2 * (svd_h$v %*% diag(inv_d) %*% t(svd_h$u))
+      sqrt(pmax(diag(cov_m), 0))
+    }, error = function(e2) {
+      message("  [Warning] SE computation failed: ", conditionMessage(e2))
+      rep(NA_real_, n_par)
+    })
+  })
+  names(se_params) <- names(p)
+
+  list(
+    ka        = ka,
+    kd        = kd,
+    Rmax      = Rmax,
+    tau_dv    = tau_dv,
+    KD        = KD,
+    KD_nM     = KD * 1e9,
+    R0_cycles = R0_init,
+    se        = se_params,
+    converged = fit$info %in% 1:4,
+    rss       = rss,
+    tt        = tt,
+    Y         = Y,
+    R_pred    = R_pred_full
+  )
+}
+
+# ── Plot: SCK extended fit — full sensorgram + cycles 1–3 zoom panel ──────────
+# Returns a patchwork of two panels stacked vertically (2:1 height ratio).
+plot_sck_dv_fit <- function(gfit, conc_M, tass_vec, tdiss_vec) {
+  tau_dv   <- gfit$tau_dv
+  n_cycles <- length(tass_vec)
+  conc_nM  <- round(conc_M * 1e9, 3)
+
+  df <- data.frame(
+    Time     = gfit$tt,
+    Response = gfit$Y,
+    Fit      = replace(gfit$R_pred, is.na(gfit$R_pred), 0)
+  )
+
+  tass_eff  <- tass_vec  + tau_dv
+  tdiss_eff <- tdiss_vec + tau_dv
+
+  # Annotation data frames (all cycles)
+  ann_nom    <- data.frame(x = c(tass_vec, tdiss_vec))
+  ann_eff_a  <- data.frame(x = tass_eff)
+  ann_eff_d  <- data.frame(x = tdiss_eff)
+  ann_lbl    <- data.frame(x = tass_vec, label = paste0(conc_nM, " nM"))
+
+  subtitle_txt <- sprintf(
+    "ka = %.3e M\u207b\u00b9s\u207b\u00b9  |  kd = %.4f s\u207b\u00b9  |  K\u1d05 = %.2f nM  |  Rmax = %.2f RU  |  \u03c4\u1d48\u1d5b = %.1f s  |  RSS = %.2f",
+    gfit$ka, gfit$kd, gfit$KD_nM, gfit$Rmax, tau_dv, gfit$rss
+  )
+
+  base_layers <- list(
+    geom_vline(data = ann_nom,   aes(xintercept = x),
+               colour = "grey60", linewidth = 0.4),
+    geom_vline(data = ann_eff_a, aes(xintercept = x),
+               colour = PALETTE[1], linetype = "dashed", linewidth = 0.5),
+    geom_vline(data = ann_eff_d, aes(xintercept = x),
+               colour = PALETTE[4], linetype = "dashed", linewidth = 0.5),
+    geom_point(aes(y = Response), size = 0.5, alpha = 0.4,
+               colour = "grey50", shape = 16),
+    geom_line(aes(y = Fit), colour = PALETTE[2], linewidth = 1.0),
+    theme_minimal(base_size = 11),
+    theme(panel.grid.minor = element_blank(),
+          panel.border     = element_rect(colour = "grey80", fill = NA))
+  )
+
+  # ── Full sensorgram ──────────────────────────────────────────────────────────
+  p_full <- ggplot(df, aes(x = Time)) +
+    base_layers +
+    geom_text(data = ann_lbl, aes(x = x, label = label),
+              y = Inf, vjust = 1.4, hjust = -0.05, size = 2.8, colour = "grey40") +
+    labs(
+      title   = "SCK extended \u2014 shared dead-volume delay \u03c4\u1d48\u1d5b",
+      subtitle = subtitle_txt,
+      x = "Time (s)", y = "Response (RU)",
+      caption = "Grey verticals: nominal tass/tdiss  |  Blue dashed: tass + \u03c4\u1d48\u1d5b  |  Green dashed: tdiss + \u03c4\u1d48\u1d5b"
+    ) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 8, colour = "grey30"),
+      plot.caption  = element_text(size = 7.5, colour = "grey50")
+    )
+
+  # ── Zoom panel: cycles 1–3 ───────────────────────────────────────────────────
+  n_z          <- min(3L, n_cycles)
+  ann_nom_z    <- data.frame(x = c(tass_vec[1:n_z], tdiss_vec[1:n_z]))
+  ann_eff_a_z  <- data.frame(x = tass_eff[1:n_z])
+  ann_eff_d_z  <- data.frame(x = tdiss_eff[1:n_z])
+  ann_lbl_z    <- data.frame(x = tass_vec[1:n_z],
+                              label = paste0(conc_nM[1:n_z], " nM"))
+
+  p_zoom <- ggplot(df, aes(x = Time)) +
+    geom_vline(data = ann_nom_z,   aes(xintercept = x),
+               colour = "grey60", linewidth = 0.4) +
+    geom_vline(data = ann_eff_a_z, aes(xintercept = x),
+               colour = PALETTE[1], linetype = "dashed", linewidth = 0.5) +
+    geom_vline(data = ann_eff_d_z, aes(xintercept = x),
+               colour = PALETTE[4], linetype = "dashed", linewidth = 0.5) +
+    geom_point(aes(y = Response), size = 0.8, alpha = 0.5,
+               colour = "grey50", shape = 16) +
+    geom_line(aes(y = Fit), colour = PALETTE[2], linewidth = 1.0) +
+    geom_text(data = ann_lbl_z, aes(x = x, label = label),
+              y = 4, vjust = 1.3, hjust = -0.05, size = 2.8, colour = "grey40") +
+    coord_cartesian(xlim = c(0, 600), ylim = c(0, 4)) +
+    labs(
+      title = "Zoom: cycles 1\u20133  (t\u00a0=\u00a00\u2013600\u00a0s,  R\u00a0=\u00a00\u20134\u00a0RU)",
+      x = "Time (s)", y = "Response (RU)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 10),
+      panel.grid.minor = element_blank(),
+      panel.border     = element_rect(colour = "grey80", fill = NA)
+    )
+
+  (p_full / p_zoom) + plot_layout(heights = c(2, 1))
+}
+
 # ── Parse time parameter (single value or comma-separated vector) ─────────────
 parse_time <- function(t_str, mode_default) {
   if (is.null(t_str)) return(mode_default)

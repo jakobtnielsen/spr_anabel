@@ -151,6 +151,30 @@ if (!is.na(se["Rmax"])) {
   }
 }
 
+# ── R₀ diagnostic table ──────────────────────────────────────────────────────
+# Compares pre-injection R₀ (old), τ_dv-corrected R₀ (new), the difference,
+# and the expected dissociation during τ_dv under the fitted kd.
+# If the model is self-consistent: R₀_corrected ≈ R₀_pre × exp(−kd × τ_dv),
+# i.e. Difference ≈ 0 within noise.
+R0_pre     <- gfit$R0_cycles
+R0_corr    <- gfit$R0_corrected
+R0_modpred <- R0_pre * exp(-gfit$kd * gfit$tau_dv)   # old model's R0_eff
+diff_R0    <- R0_corr - R0_modpred                    # should be ~0 if self-consistent
+exp_decay  <- R0_pre * (1 - exp(-gfit$kd * gfit$tau_dv))
+
+cat(sprintf(
+  "  \u2500\u2500 R\u2080 diagnostic  (\u03c4_dv = %.2f s,  kd = %.5f s\u207b\u00b9) %s\n",
+  gfit$tau_dv, gfit$kd, strrep("\u2500", 22)))
+cat(sprintf("  %-7s  %-12s  %-14s  %-12s  %-14s\n",
+            "Cycle", "R\u2080_pre (RU)", "R\u2080_corr (RU)", "Diff (RU)", "Exp. decay (RU)"))
+cat(sprintf("  %s\n", strrep("\u2500", 64)))
+for (n in seq_along(tass)) {
+  cat(sprintf("  %-7d  %-12.4f  %-14.4f  %-12.4f  %-14.4f\n",
+              n, R0_pre[n], R0_corr[n], diff_R0[n], exp_decay[n]))
+}
+cat(sprintf("  %s\n", strrep("\u2500", 64)))
+cat("  Self-consistent if Diff \u2248 0 (R\u2080_corr \u2248 R\u2080_pre \u00d7 exp(\u2212kd\u00d7\u03c4_dv))\n\n")
+
 # ── Two-panel plot ────────────────────────────────────────────────────────────
 dir.create(opt$outdir, showWarnings = FALSE, recursive = TRUE)
 p_dv <- plot_sck_dv_fit(gfit, conc_M, tass, tdiss)

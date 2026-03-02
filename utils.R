@@ -478,6 +478,22 @@ plot_sck_custom_fit <- function(gfit, conc_M, tass_vec, tdiss_vec) {
     )
 }
 
+# ── Helper: interpolate observed signal at analyte arrival time ───────────────
+# Returns Y linearly interpolated at t = tass_n + tau_dv.
+# Used by fit_sck_global_dv() so that the association phase starts from the
+# actual signal at the moment analyte reaches the chip, rather than from the
+# exponential-decay model prediction R₀_pre × exp(−kd × τ_dv).
+get_R0_at_arrival <- function(tt, Y, tass_n, tau_dv) {
+  t_arr  <- tass_n + tau_dv
+  before <- which(tt <= t_arr)
+  after  <- which(tt >= t_arr)
+  if (length(before) == 0) return(Y[after[1]])
+  if (length(after)  == 0) return(Y[before[length(before)]])
+  i1 <- before[length(before)];  i2 <- after[1]
+  if (i1 == i2) return(Y[i1])
+  Y[i1] + (Y[i2] - Y[i1]) * (t_arr - tt[i1]) / (tt[i2] - tt[i1])
+}
+
 # ── Custom SCK fitter: shared dead-volume delay τ_dv ─────────────────────────
 #
 # Extends fit_sck_global() by replacing per-cycle onset detection with a single
@@ -522,6 +538,10 @@ fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
               sum(!ri_mask), length(tt)))
 
   # ── Model prediction ────────────────────────────────────────────────────────
+  # R₀_eff_n: interpolated from observed data at tass_n + tau_dv.
+  # This is a deterministic function of tau_dv — no new free parameters.
+  # It bypasses any model error during the dead-volume window and ensures
+  # the association phase starts from the actual signal at analyte arrival.
   sck_pred_dv <- function(ka, kd, Rmax, tau_dv) {
     KD     <- kd / ka
     R_pred <- rep(NA_real_, length(tt))
@@ -529,7 +549,7 @@ fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
       kobs_n      <- ka * conc_M[n] + kd
       Req_n       <- Rmax * conc_M[n] / (conc_M[n] + KD)
       R0_n        <- R0_init[n]
-      R0_eff_n    <- R0_n * exp(-kd * tau_dv)
+      R0_eff_n    <- get_R0_at_arrival(tt, Y, tass_vec[n], tau_dv)  # data at arrival
       tass_eff_n  <- tass_vec[n]  + tau_dv
       tdiss_eff_n <- tdiss_vec[n] + tau_dv
       t_end_n     <- if (n < n_cycles) tass_vec[n + 1] else tend
@@ -581,12 +601,41 @@ fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
   Rmax_init <- max(Y, na.rm = TRUE) / sat_frac
   ka_init   <- kd_init / KD_guess
 
-  p0 <- c(ka = ka_init, kd = kd_init, Rmax = Rmax_init, tau_dv = 15)
+  # Smart initial τ_dv: use onset detection on the highest-concentration cycle
+  # (fastest rise → most reliable slope detection → interpolation stays in the
+  # dead-volume/dissociation window where it is physically meaningful).
+  # Only used for initialisation — the model uses interpolation throughout.
+  tau_dv_init <- tryCatch({
+    n_hi   <- n_cycles
+    start  <- tass_vec[n_hi] + ri_window
+    post   <- tt > start & tt < tdiss_vec[n_hi]
+    tt_p   <- tt[post];  Y_p <- Y[post]
+    if (length(Y_p) < 6) stop("too few points")
+    pre_pts <- tt >= (tass_vec[n_hi] - 10) & tt < tass_vec[n_hi]
+    noise   <- max(if (sum(pre_pts) >= 3) sd(Y[pre_pts], na.rm = TRUE) else 0.05, 0.01)
+    sl_thr  <- 3 * noise / 5
+    consec  <- 0L
+    result  <- ri_window   # fallback
+    for (i in seq_len(length(Y_p) - 4L)) {
+      sl <- (Y_p[i + 4L] - Y_p[i]) / (tt_p[i + 4L] - tt_p[i])
+      if (sl > sl_thr) {
+        consec <- consec + 1L
+        if (consec >= 2L) { result <- max(tt_p[i] - tass_vec[n_hi], ri_window); break }
+      } else {
+        consec <- 0L
+      }
+    }
+    result
+  }, error = function(e) ri_window)
+  tau_dv_init <- max(min(tau_dv_init, 30), ri_window)  # clamp to [3, 30]
+  cat(sprintf("  tau_dv_init  : %.1f s (from highest-conc onset)\n", tau_dv_init))
+
+  p0 <- c(ka = ka_init, kd = kd_init, Rmax = Rmax_init, tau_dv = tau_dv_init)
   lb <- c(ka = 1,       kd = 1e-6,    Rmax = 0.01,      tau_dv =  0)
   ub <- c(ka = Inf,     kd = Inf,     Rmax = Inf,        tau_dv = 60)
 
-  cat(sprintf("  Init         : ka=%.2e  kd=%.4f  Rmax=%.2f  tau_dv=15 s\n",
-              ka_init, kd_init, Rmax_init))
+  cat(sprintf("  Init         : ka=%.2e  kd=%.4f  Rmax=%.2f  tau_dv=%.1f s\n",
+              ka_init, kd_init, Rmax_init, tau_dv_init))
 
   fit <- minpack.lm::nls.lm(
     par     = p0,
@@ -634,20 +683,25 @@ fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
   })
   names(se_params) <- names(p)
 
+  # R₀ corrected: data-interpolated at tass_n + tau_dv (for diagnostic)
+  R0_corrected <- sapply(seq_len(n_cycles), function(n)
+    get_R0_at_arrival(tt, Y, tass_vec[n], tau_dv))
+
   list(
-    ka        = ka,
-    kd        = kd,
-    Rmax      = Rmax,
-    tau_dv    = tau_dv,
-    KD        = KD,
-    KD_nM     = KD * 1e9,
-    R0_cycles = R0_init,
-    se        = se_params,
-    converged = fit$info %in% 1:4,
-    rss       = rss,
-    tt        = tt,
-    Y         = Y,
-    R_pred    = R_pred_full
+    ka           = ka,
+    kd           = kd,
+    Rmax         = Rmax,
+    tau_dv       = tau_dv,
+    KD           = KD,
+    KD_nM        = KD * 1e9,
+    R0_cycles    = R0_init,      # pre-injection window (old method)
+    R0_corrected = R0_corrected, # τ_dv-corrected, interpolated at arrival
+    se           = se_params,
+    converged    = fit$info %in% 1:4,
+    rss          = rss,
+    tt           = tt,
+    Y            = Y,
+    R_pred       = R_pred_full
   )
 }
 

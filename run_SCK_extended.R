@@ -20,19 +20,30 @@ source(file.path(SCRIPT_DIR, "utils.R"))
 
 MODE <- "SCK"
 
+extra_opts <- list(
+  optparse::make_option("--r0_method", type = "character", default = "v2",
+    help = "R0 method: 'v1' (decay model) or 'v2' (data interpolation) [default: v2]")
+)
+
 opt <- safe_parse(
-  shared_options(MODE),
+  c(shared_options(MODE), extra_opts),
   description = paste(
     "SCK extended: Single-Cycle Kinetics with a shared dead-volume delay tau_dv.",
-    "tass and tdiss must be comma-separated vectors."
+    "tass and tdiss must be comma-separated vectors.",
+    "--r0_method v1 uses R0_eff = R0_pre * exp(-kd*tau_dv);",
+    "--r0_method v2 (default) interpolates R0_eff from data at tass_n + tau_dv."
   )
 )
 
 if (is.null(opt$outdir)) opt$outdir <- file.path("output", "SCK_extended")
 if (is.null(opt$label))  opt$label  <- format(Sys.time(), "%Y%m%d_%H%M%S")
 
+if (!opt$r0_method %in% c("v1", "v2"))
+  stop("--r0_method must be 'v1' or 'v2'.")
+
 print_banner("SCK-EXT")
 cat("  Mode  : SCK Extended (shared dead-volume delay \u03c4_dv)\n")
+cat("  R0 method:", opt$r0_method, "\n")
 cat("  Label :", opt$label, "\n")
 cat("  Outdir:", opt$outdir, "\n\n")
 
@@ -89,7 +100,8 @@ enriched_kt <- enrich_kinetics(result$kinetics, conc_M)
 
 # ── Run extended fitter ───────────────────────────────────────────────────────
 cat("\nRunning fit_sck_global_dv() (shared \u03c4_dv)...\n")
-gfit <- fit_sck_global_dv(df, conc_M, tass, tdiss, tstart, tend, ri_window = 3)
+gfit <- fit_sck_global_dv(df, conc_M, tass, tdiss, tstart, tend, ri_window = 3,
+                          r0_method = opt$r0_method)
 
 # ── Parameter comparison table ────────────────────────────────────────────────
 se        <- gfit$se

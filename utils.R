@@ -507,7 +507,7 @@ get_R0_at_arrival <- function(tt, Y, tass_n, tau_dv) {
 # RI mask: nominal tass_n and tdiss_n only (no mask at effective onset times).
 # SE: estimated from the Gauss-Newton Hessian (J^T J) returned by nls.lm.
 fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
-                               ri_window = 3) {
+                               ri_window = 3, r0_method = "v2") {
   require(minpack.lm)
 
   time_col <- grep("time", names(df), ignore.case = TRUE)[1]
@@ -525,6 +525,7 @@ fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
     if (sum(pre) == 0) return(0)
     mean(Y[pre], na.rm = TRUE)
   }), 0)
+  cat(sprintf("  r0_method    : %s\n", r0_method))
   cat(sprintf("  R\u2080 from data : %s RU\n",
               paste(sprintf("%.3f", R0_init), collapse = ", ")))
 
@@ -549,7 +550,10 @@ fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
       kobs_n      <- ka * conc_M[n] + kd
       Req_n       <- Rmax * conc_M[n] / (conc_M[n] + KD)
       R0_n        <- R0_init[n]
-      R0_eff_n    <- get_R0_at_arrival(tt, Y, tass_vec[n], tau_dv)  # data at arrival
+      R0_eff_n    <- if (r0_method == "v1")
+                       R0_n * exp(-kd * tau_dv)                          # v1: decay model
+                     else
+                       get_R0_at_arrival(tt, Y, tass_vec[n], tau_dv)     # v2: data interp
       tass_eff_n  <- tass_vec[n]  + tau_dv
       tdiss_eff_n <- tdiss_vec[n] + tau_dv
       t_end_n     <- if (n < n_cycles) tass_vec[n + 1] else tend
@@ -601,11 +605,10 @@ fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
   Rmax_init <- max(Y, na.rm = TRUE) / sat_frac
   ka_init   <- kd_init / KD_guess
 
-  # Smart initial τ_dv: use onset detection on the highest-concentration cycle
-  # (fastest rise → most reliable slope detection → interpolation stays in the
-  # dead-volume/dissociation window where it is physically meaningful).
-  # Only used for initialisation — the model uses interpolation throughout.
-  tau_dv_init <- tryCatch({
+  # τ_dv initialisation: v1 uses a fixed 15 s guess; v2 detects onset on the
+  # highest-concentration cycle (fastest rise → interpolation stays in the
+  # dead-volume window where it is physically meaningful).
+  tau_dv_init <- if (r0_method == "v1") 15 else tryCatch({
     n_hi   <- n_cycles
     start  <- tass_vec[n_hi] + ri_window
     post   <- tt > start & tt < tdiss_vec[n_hi]
@@ -628,7 +631,8 @@ fit_sck_global_dv <- function(df, conc_M, tass_vec, tdiss_vec, tstart, tend,
     result
   }, error = function(e) ri_window)
   tau_dv_init <- max(min(tau_dv_init, 30), ri_window)  # clamp to [3, 30]
-  cat(sprintf("  tau_dv_init  : %.1f s (from highest-conc onset)\n", tau_dv_init))
+  cat(sprintf("  tau_dv_init  : %.1f s (%s)\n", tau_dv_init,
+              if (r0_method == "v1") "fixed" else "from highest-conc onset"))
 
   p0 <- c(ka = ka_init, kd = kd_init, Rmax = Rmax_init, tau_dv = tau_dv_init)
   lb <- c(ka = 1,       kd = 1e-6,    Rmax = 0.01,      tau_dv =  0)

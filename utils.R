@@ -803,6 +803,330 @@ plot_sck_dv_fit <- function(gfit, conc_M, tass_vec, tdiss_vec) {
   (p_full / p_zoom) + plot_layout(heights = c(2, 1))
 }
 
+# ── Custom MCK fitter: shared dead-volume delay τ_dv + RI bulk shift ─────────
+#
+# Extends the standard MCK pipeline by adding two physically motivated parameters:
+#   τ_dv  (s)   — shared dead-volume delay: analyte arrives at chip tass + τ_dv
+#   ri_coef     — RI bulk-shift coefficient (RU per M): bshift_n = ri_coef × [A]_n
+#
+# For every cycle n (MCK: each cycle is a separate response column):
+#   [tstart,         tass]         : baseline (not fitted; already zero)
+#   [tass,           tass + τ_dv]  : pure dissociation from R₀_n (dead volume)
+#   [tass + τ_dv,    tdiss]        : 1:1 Langmuir association + bshift_n
+#   [tdiss,          tend]         : pure dissociation from R_end_n (no bshift)
+#
+# R₀_n        : mean observed signal in [tass-5, tass)
+# R₀_eff_n    : interpolated from data at tass + τ_dv (v2, data-driven)
+# bshift_n    : ri_coef × conc_M[n]  — RI offset present only during assoc
+# R_end_n     : true binding signal at tdiss (bshift has already been subtracted)
+#
+# SE: Gauss-Newton Hessian with scaled inversion + SVD pseudoinverse fallback.
+fit_mck_global_dv <- function(df, conc_M, tass, tdiss, tstart, tend,
+                               ri_window = 3) {
+  require(minpack.lm)
+
+  time_col  <- grep("time", names(df), ignore.case = TRUE)[1]
+  resp_cols <- setdiff(seq_along(df), time_col)
+  tt_all    <- df[[time_col]]
+  n_cycles  <- length(resp_cols)
+
+  keep <- tt_all >= tstart & tt_all <= tend
+  tt   <- tt_all[keep]
+
+  Y_list <- lapply(resp_cols, function(j) df[[j]][keep])
+
+  # R₀_n from data: mean signal in [tass − 5, tass)
+  R0_init <- sapply(seq_len(n_cycles), function(n) {
+    pre <- tt >= (tass - 5) & tt < tass & !is.na(Y_list[[n]])
+    if (sum(pre) == 0) return(0)
+    max(mean(Y_list[[n]][pre], na.rm = TRUE), 0)
+  })
+  cat(sprintf("  R\u2080 from data : %s RU\n",
+              paste(sprintf("%.3f", R0_init), collapse = ", ")))
+
+  # RI mask: [tass, tass+ri_window] and [tdiss, tdiss+ri_window]
+  ri_mask <- !(tt >= tass  & tt < tass  + ri_window) &
+             !(tt >= tdiss & tt < tdiss + ri_window)
+  cat(sprintf("  RI mask      : %d / %d points excluded per cycle\n",
+              sum(!ri_mask), length(tt)))
+
+  # ── Model prediction ─────────────────────────────────────────────────────────
+  mck_pred_dv <- function(ka, kd, Rmax, tau_dv, ri_coef) {
+    KD       <- kd / ka
+    tass_eff <- tass + tau_dv
+    R_pred_list <- vector("list", n_cycles)
+    for (n in seq_len(n_cycles)) {
+      kobs_n   <- ka * conc_M[n] + kd
+      Req_n    <- Rmax * conc_M[n] / (conc_M[n] + KD)
+      R0_n     <- R0_init[n]
+      bshift_n <- ri_coef * conc_M[n]
+      Y_n      <- Y_list[[n]]
+
+      # R₀_eff_n: data-interpolated at analyte arrival time
+      R0_eff_n <- get_R0_at_arrival(tt, Y_n, tass, tau_dv)
+
+      R_pred <- rep(NA_real_, length(tt))
+
+      # Dead volume: pure dissociation from R₀_n
+      dv_mask <- tt >= tass & tt < tass_eff
+      if (any(dv_mask))
+        R_pred[dv_mask] <- R0_n * exp(-kd * (tt[dv_mask] - tass))
+
+      # Association: tass_eff → tdiss (with RI bulk shift)
+      a_mask <- tt >= tass_eff & tt <= tdiss
+      if (any(a_mask)) {
+        dt_a <- tt[a_mask] - tass_eff
+        R_pred[a_mask] <- Req_n + (R0_eff_n - Req_n) * exp(-kobs_n * dt_a) +
+                          bshift_n
+      }
+
+      # True binding signal at end of association (bshift gone at tdiss)
+      R_end_n <- Req_n + (R0_eff_n - Req_n) *
+                 exp(-kobs_n * (tdiss - tass - tau_dv))
+
+      # Dissociation: tdiss → tend (no bshift)
+      d_mask <- tt > tdiss & tt <= tend
+      if (any(d_mask))
+        R_pred[d_mask] <- R_end_n * exp(-kd * (tt[d_mask] - tdiss))
+
+      R_pred_list[[n]] <- R_pred
+    }
+    R_pred_list
+  }
+
+  # ── Residual function (concatenate all cycles) ───────────────────────────────
+  resid_fn <- function(p) {
+    ka <- p[["ka"]]; kd <- p[["kd"]]; Rmax <- p[["Rmax"]]
+    tau_dv <- p[["tau_dv"]]; ri_coef <- p[["ri_coef"]]
+    if (any(c(ka, kd, Rmax) <= 0) || tau_dv < 0)
+      return(rep(1e6, n_cycles * sum(ri_mask)))
+    preds <- mck_pred_dv(ka, kd, Rmax, tau_dv, ri_coef)
+    resids <- c()
+    for (n in seq_len(n_cycles)) {
+      valid <- ri_mask & !is.na(preds[[n]])
+      resids <- c(resids, Y_list[[n]][valid] - preds[[n]][valid])
+    }
+    resids
+  }
+
+  # ── Initial estimates ────────────────────────────────────────────────────────
+  # All init estimates use the highest-concentration cycle (fastest signal rise,
+  # largest bshift, best SNR for dissociation). Works regardless of concentration
+  # ordering in the input CSV (ascending or descending).
+  n_hi   <- which.max(conc_M)
+  Y_hi   <- Y_list[[n_hi]]
+
+  # kd_init: log-linear regression on highest-conc dissociation
+  kd_init <- tryCatch({
+    mask <- tt > tdiss & ri_mask
+    t_d  <- tt[mask] - tdiss
+    R_d  <- Y_hi[mask]
+    pos  <- R_d > 0.05 * max(R_d, na.rm = TRUE) & t_d > 0
+    if (sum(pos) < 5) return(0.01)
+    max(-coef(lm(log(R_d[pos]) ~ t_d[pos]))[2], 1e-4)
+  }, error = function(e) 0.01)
+
+  KD_guess  <- kd_init / 1e6
+  sat_frac  <- max(conc_M) / (max(conc_M) + KD_guess)
+  Rmax_init <- max(Y_hi[tt >= tass & tt <= tdiss], na.rm = TRUE) / sat_frac
+  ka_init   <- kd_init / KD_guess
+
+  # tau_dv_init: slope-based onset on highest-[A] column
+  tau_dv_init <- tryCatch({
+    start  <- tass + ri_window
+    post   <- tt > start & tt < tdiss
+    tt_p   <- tt[post]; Y_p <- Y_hi[post]
+    if (length(Y_p) < 6) stop("too few points")
+    pre_pts <- tt >= (tass - 10) & tt < tass
+    noise   <- max(if (sum(pre_pts) >= 3) sd(Y_hi[pre_pts], na.rm = TRUE)
+                   else 0.05, 0.01)
+    sl_thr  <- 3 * noise / 5
+    consec  <- 0L; result <- ri_window
+    for (i in seq_len(length(Y_p) - 4L)) {
+      sl <- (Y_p[i + 4L] - Y_p[i]) / (tt_p[i + 4L] - tt_p[i])
+      if (sl > sl_thr) {
+        consec <- consec + 1L
+        if (consec >= 2L) { result <- max(tt_p[i] - tass, ri_window); break }
+      } else consec <- 0L
+    }
+    result
+  }, error = function(e) ri_window)
+  tau_dv_init <- max(min(tau_dv_init, 30), ri_window)
+
+  # ri_coef_init: step drop at tdiss for highest-[A] cycle / conc_hi
+  # The step drop (signal before tdiss minus signal after RI spike clears) ≈ bshift_hi.
+  ri_coef_init <- tryCatch({
+    pre_d  <- tt >= (tdiss - 3) & tt < tdiss
+    post_d <- tt >= (tdiss + ri_window) & tt < (tdiss + ri_window + 5)
+    if (sum(pre_d) < 2 || sum(post_d) < 2) return(0)
+    step <- mean(Y_hi[pre_d], na.rm = TRUE) -
+            mean(Y_hi[post_d], na.rm = TRUE)
+    max(step, 0) / conc_M[n_hi]
+  }, error = function(e) 0)
+
+  cat(sprintf("  tau_dv_init  : %.1f s (from highest-conc onset, cycle %d)\n",
+              tau_dv_init, n_hi))
+  cat(sprintf("  ri_coef_init : %.4e RU/M\n", ri_coef_init))
+  cat(sprintf("  Init         : ka=%.2e  kd=%.4f  Rmax=%.2f  tau_dv=%.1f  ri_coef=%.3e\n",
+              ka_init, kd_init, Rmax_init, tau_dv_init, ri_coef_init))
+
+  p0 <- c(ka = ka_init, kd = kd_init, Rmax = Rmax_init,
+          tau_dv = tau_dv_init, ri_coef = ri_coef_init)
+  lb <- c(ka = 1, kd = 1e-6, Rmax = 0.01, tau_dv = 0, ri_coef = 0)
+  ub <- c(ka = Inf, kd = Inf, Rmax = Inf, tau_dv = 60, ri_coef = 1e9)
+
+  fit <- minpack.lm::nls.lm(
+    par     = p0,
+    fn      = resid_fn,
+    lower   = lb,
+    upper   = ub,
+    control = minpack.lm::nls.lm.control(maxiter = 1000, ftol = 1e-12, ptol = 1e-12)
+  )
+
+  p       <- fit$par
+  ka      <- p[["ka"]]; kd <- p[["kd"]]; Rmax <- p[["Rmax"]]
+  tau_dv  <- p[["tau_dv"]]; ri_coef <- p[["ri_coef"]]
+  KD      <- kd / ka
+  R_pred_list_full <- mck_pred_dv(ka, kd, Rmax, tau_dv, ri_coef)
+
+  # ── SE from Gauss-Newton Hessian ─────────────────────────────────────────────
+  n_obs  <- n_cycles * sum(ri_mask & !is.na(R_pred_list_full[[1]]))
+  n_par  <- length(p)
+  rss    <- sum(fit$fvec^2)
+  sigma2 <- rss / max(n_obs - n_par, 1L)
+
+  se_params <- tryCatch({
+    h    <- fit$hessian
+    sc   <- sqrt(pmax(diag(h), .Machine$double.eps))
+    h_sc <- h / outer(sc, sc)
+    cov_m <- sigma2 * solve(h_sc) / outer(sc, sc)
+    sqrt(pmax(diag(cov_m), 0))
+  }, error = function(e) {
+    tryCatch({
+      svd_h <- svd(fit$hessian)
+      tol   <- max(svd_h$d) * .Machine$double.eps * n_par * 1e4
+      inv_d <- ifelse(svd_h$d > tol, 1 / svd_h$d, 0)
+      cov_m <- sigma2 * (svd_h$v %*% diag(inv_d) %*% t(svd_h$u))
+      sqrt(pmax(diag(cov_m), 0))
+    }, error = function(e2) {
+      message("  [Warning] SE computation failed: ", conditionMessage(e2))
+      rep(NA_real_, n_par)
+    })
+  })
+  names(se_params) <- names(p)
+
+  list(
+    ka               = ka,
+    kd               = kd,
+    Rmax             = Rmax,
+    tau_dv           = tau_dv,
+    ri_coef          = ri_coef,
+    KD               = KD,
+    KD_nM            = KD * 1e9,
+    bshift_per_cycle = ri_coef * conc_M,
+    R0_per_cycle     = R0_init,
+    se               = se_params,
+    converged        = fit$info %in% 1:4,
+    rss              = rss,
+    tt               = tt,
+    Y_list           = Y_list,
+    R_pred_list      = R_pred_list_full
+  )
+}
+
+# ── Plot: MCK extended fit — full sensorgram + cycles 1–3 zoom panel ──────────
+# Returns a patchwork of two panels stacked vertically (2:1 height ratio).
+# Each cycle is plotted in a distinct colour matching PALETTE (recycled).
+plot_mck_dv_fit <- function(gfit, conc_M, tass, tdiss) {
+  tau_dv   <- gfit$tau_dv
+  n_cycles <- length(conc_M)
+  conc_nM  <- round(conc_M * 1e9, 3)
+
+  tass_eff <- tass + tau_dv
+
+  # Build long-format data frame (all cycles)
+  df_long <- do.call(rbind, lapply(seq_len(n_cycles), function(n) {
+    data.frame(
+      Time     = gfit$tt,
+      Response = gfit$Y_list[[n]],
+      Fit      = replace(gfit$R_pred_list[[n]], is.na(gfit$R_pred_list[[n]]), NA),
+      Cycle    = factor(paste0(conc_nM[n], " nM"), levels = paste0(conc_nM, " nM"))
+    )
+  }))
+
+  cols <- rep_len(PALETTE, n_cycles)
+  names(cols) <- levels(df_long$Cycle)
+
+  ann_nom  <- data.frame(x = c(tass, tdiss))
+  ann_eff  <- data.frame(x = tass_eff)
+
+  subtitle_txt <- sprintf(
+    "ka = %.3e M\u207b\u00b9s\u207b\u00b9 | kd = %.5f s\u207b\u00b9 | K\u1d05 = %.2f nM | Rmax = %.2f RU | \u03c4\u1d48\u1d5b = %.1f s | ri_coef = %.3e RU/M | RSS = %.2f",
+    gfit$ka, gfit$kd, gfit$KD_nM, gfit$Rmax, tau_dv, gfit$ri_coef, gfit$rss
+  )
+
+  base_layers <- list(
+    geom_vline(data = ann_nom, aes(xintercept = x),
+               colour = "grey60", linewidth = 0.4),
+    geom_vline(data = ann_eff, aes(xintercept = x),
+               colour = PALETTE[1], linetype = "dashed", linewidth = 0.5),
+    geom_point(aes(y = Response, colour = Cycle), size = 0.4, alpha = 0.35, shape = 16),
+    geom_line(aes(y = Fit, colour = Cycle), linewidth = 0.9, na.rm = TRUE),
+    scale_colour_manual(values = cols),
+    theme_minimal(base_size = 11),
+    theme(panel.grid.minor = element_blank(),
+          panel.border     = element_rect(colour = "grey80", fill = NA),
+          legend.position  = "right",
+          legend.key.size  = unit(0.5, "lines"))
+  )
+
+  # ── Full sensorgram ──────────────────────────────────────────────────────────
+  p_full <- ggplot(df_long, aes(x = Time)) +
+    base_layers +
+    labs(
+      title    = "MCK extended \u2014 dead-volume delay \u03c4\u1d48\u1d5b + RI bulk shift",
+      subtitle = subtitle_txt,
+      x = "Time (s)", y = "Response (RU)", colour = "Conc.",
+      caption  = "Grey verticals: nominal tass/tdiss  |  Blue dashed: tass + \u03c4\u1d48\u1d5b"
+    ) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 7.5, colour = "grey30"),
+      plot.caption  = element_text(size = 7.5, colour = "grey50")
+    )
+
+  # ── Zoom panel: first 3 cycles ───────────────────────────────────────────────
+  n_z     <- min(3L, n_cycles)
+  lvls_z  <- levels(df_long$Cycle)[1:n_z]
+  df_zoom <- df_long[df_long$Cycle %in% lvls_z, ]
+  df_zoom$Cycle <- droplevels(df_zoom$Cycle)
+  cols_z  <- cols[lvls_z]
+
+  p_zoom <- ggplot(df_zoom, aes(x = Time)) +
+    geom_vline(data = ann_nom, aes(xintercept = x),
+               colour = "grey60", linewidth = 0.4) +
+    geom_vline(data = ann_eff, aes(xintercept = x),
+               colour = PALETTE[1], linetype = "dashed", linewidth = 0.5) +
+    geom_point(aes(y = Response, colour = Cycle), size = 0.7, alpha = 0.5, shape = 16) +
+    geom_line(aes(y = Fit, colour = Cycle), linewidth = 0.9, na.rm = TRUE) +
+    scale_colour_manual(values = cols_z) +
+    coord_cartesian(xlim = c(tass - 10, tdiss + 60)) +
+    labs(
+      title  = "Zoom: lowest 3 concentrations",
+      x = "Time (s)", y = "Response (RU)", colour = "Conc."
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 10),
+      panel.grid.minor = element_blank(),
+      panel.border     = element_rect(colour = "grey80", fill = NA),
+      legend.position  = "right",
+      legend.key.size  = unit(0.5, "lines")
+    )
+
+  (p_full / p_zoom) + plot_layout(heights = c(2, 1))
+}
+
 # ── Parse time parameter (single value or comma-separated vector) ─────────────
 parse_time <- function(t_str, mode_default) {
   if (is.null(t_str)) return(mode_default)

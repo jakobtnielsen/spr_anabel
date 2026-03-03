@@ -116,6 +116,7 @@ parse_conc <- function(conc_str, conc_unit, mode) {
   }
   vals <- as.numeric(trimws(strsplit(conc_str, ",")[[1]]))
   cat("  Conc  :", paste(vals, collapse = ", "), conc_unit, "\n")
+  if (toupper(conc_unit) == "M") return(vals)
   convert_toMolar(val = vals, unit = conc_unit)
 }
 
@@ -1111,6 +1112,327 @@ plot_mck_dv_fit <- function(gfit, conc_M, tass, tdiss) {
     geom_line(aes(y = Fit, colour = Cycle), linewidth = 0.9, na.rm = TRUE) +
     scale_colour_manual(values = cols_z) +
     coord_cartesian(xlim = c(tass - 10, tdiss + 60)) +
+    labs(
+      title  = "Zoom: lowest 3 concentrations",
+      x = "Time (s)", y = "Response (RU)", colour = "Conc."
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 10),
+      panel.grid.minor = element_blank(),
+      panel.border     = element_rect(colour = "grey80", fill = NA),
+      legend.position  = "right",
+      legend.key.size  = unit(0.5, "lines")
+    )
+
+  (p_full / p_zoom) + plot_layout(heights = c(2, 1))
+}
+
+# ── Carterra-style fitter: global ka + kd, per-cycle Rmax (VARPRO + nls.lm) ──
+#
+# Designed for MCK-format input that has already been baseline-corrected per
+# cycle (R_n(tass) ≈ 0). Fits a global ka + kd shared across all cycles, with
+# one independent Rmax per concentration cycle. No dead-volume delay (Carterra
+# τ_dv ≈ 6 s is <2% of the 300 s association window and is not fitted).
+#
+# Two-stage optimization:
+#   Stage 1 — VARPRO: for fixed (ka, kd), compute Rmax_n analytically via OLS.
+#             Minimize total RSS over (log_ka, log_kd) with Nelder-Mead.
+#   Stage 2 — nls.lm refinement on the full (ka, kd, Rmax_1, ..., Rmax_N) vector,
+#             warm-started from Stage 1. SE via Gauss-Newton Hessian.
+#
+# Model for cycle n (baseline-corrected, R_n(tass) = 0):
+#   assoc  [tass, tdiss]:  R_n(t) = Rmax_n * sat_n * (1 - exp(-kobs_n*(t-tass)))
+#   dissoc [tdiss, tend]:  R_n(t) = R_n_end * exp(-kd*(t-tdiss))
+#   where sat_n  = cn / (cn + KD),  KD = kd/ka
+#         kobs_n = ka*cn + kd
+#         R_n_end = Rmax_n * sat_n * (1 - exp(-kobs_n*(tdiss-tass)))
+fit_carterra_style <- function(df, conc_M, tass, tdiss, tstart, tend) {
+  require(minpack.lm)
+
+  time_col  <- grep("time", names(df), ignore.case = TRUE)[1]
+  resp_cols <- setdiff(seq_along(df), time_col)
+  tt_all    <- df[[time_col]]
+  n_cycles  <- length(resp_cols)
+
+  keep <- tt_all >= tstart & tt_all <= tend
+  tt   <- tt_all[keep]
+  Y_list <- lapply(resp_cols, function(j) df[[j]][keep])
+
+  # Additional baseline correction: subtract mean(Y[t < tass]) per cycle
+  # (handles any residual offset in the MCK CSV)
+  Y_list <- lapply(Y_list, function(Y) {
+    pre <- tt < tass & !is.na(Y)
+    if (sum(pre) > 0) Y - mean(Y[pre], na.rm = TRUE) else Y
+  })
+
+  # ── Normalized model basis function per cycle ─────────────────────────────
+  # f_n(t) gives the predicted response with Rmax_n = 1.
+  make_f <- function(ka, kd, n) {
+    cn      <- conc_M[n]
+    KD      <- kd / ka
+    kobs_n  <- ka * cn + kd
+    sat_n   <- cn / (cn + KD)
+    f       <- rep(NA_real_, length(tt))
+
+    a_mask <- tt >= tass & tt <= tdiss
+    if (any(a_mask))
+      f[a_mask] <- sat_n * (1 - exp(-kobs_n * (tt[a_mask] - tass)))
+
+    R_end_frac <- sat_n * (1 - exp(-kobs_n * (tdiss - tass)))
+    d_mask <- tt > tdiss & tt <= tend
+    if (any(d_mask))
+      f[d_mask] <- R_end_frac * exp(-kd * (tt[d_mask] - tdiss))
+    f
+  }
+
+  # ── VARPRO: analytic Rmax_n for given (ka, kd) ───────────────────────────
+  varpro_rmax <- function(ka, kd) {
+    sapply(seq_len(n_cycles), function(n) {
+      f_n   <- make_f(ka, kd, n)
+      Y_n   <- Y_list[[n]]
+      valid <- !is.na(f_n) & !is.na(Y_n)
+      if (sum(valid) < 5) return(1)
+      sum_FF <- sum(f_n[valid]^2)
+      if (sum_FF < 1e-15) return(1)
+      max(sum(Y_n[valid] * f_n[valid]) / sum_FF, 0.01)
+    })
+  }
+
+  # ── VARPRO RSS ─────────────────────────────────────────────────────────────
+  varpro_rss <- function(log_par) {
+    ka <- exp(log_par[1]); kd <- exp(log_par[2])
+    if (!is.finite(ka) || !is.finite(kd) || ka <= 0 || kd <= 0) return(1e15)
+    Rmax_n <- varpro_rmax(ka, kd)
+    total  <- 0
+    for (n in seq_len(n_cycles)) {
+      f_n   <- make_f(ka, kd, n)
+      Y_n   <- Y_list[[n]]
+      valid <- !is.na(f_n) & !is.na(Y_n)
+      total <- total + sum((Y_n[valid] - Rmax_n[n] * f_n[valid])^2)
+    }
+    total
+  }
+
+  # ── Initial estimates ──────────────────────────────────────────────────────
+  n_hi <- which.max(conc_M)
+  Y_hi <- Y_list[[n_hi]]
+
+  kd_init <- tryCatch({
+    mask <- tt > tdiss & tt <= tend
+    t_d  <- tt[mask] - tdiss
+    R_d  <- Y_hi[mask]
+    pos  <- R_d > 0.05 * max(R_d, na.rm = TRUE) & t_d > 0
+    if (sum(pos) < 5) return(0.005)
+    max(-coef(lm(log(R_d[pos]) ~ t_d[pos]))[2], 1e-5)
+  }, error = function(e) 0.005)
+
+  kobs_est <- tryCatch({
+    mask  <- tt >= tass & tt <= tdiss
+    t_a   <- tt[mask] - tass
+    R_a   <- Y_hi[mask]
+    Req_e <- max(R_a, na.rm = TRUE)
+    ratio <- pmax(1 - R_a / Req_e, 1e-6)
+    max(coef(lm(-log(ratio) ~ t_a + 0))[1], kd_init + 1e-6)
+  }, error = function(e) kd_init + conc_M[n_hi] * 1e6)
+
+  ka_init <- max((kobs_est - kd_init) / conc_M[n_hi], 100)
+  cat(sprintf("  Init (VARPRO): ka=%.3e  kd=%.5f\n", ka_init, kd_init))
+
+  # ── Stage 1: VARPRO Nelder-Mead ───────────────────────────────────────────
+  opt1 <- tryCatch(
+    optim(
+      par     = c(log_ka = log(ka_init), log_kd = log(kd_init)),
+      fn      = varpro_rss,
+      method  = "Nelder-Mead",
+      control = list(maxit = 5000, reltol = 1e-12)
+    ),
+    error = function(e) {
+      message("  [Warning] VARPRO stage 1 failed: ", conditionMessage(e))
+      list(par = c(log(ka_init), log(kd_init)))
+    }
+  )
+  ka_s1   <- exp(opt1$par[1])
+  kd_s1   <- exp(opt1$par[2])
+  Rmax_s1 <- varpro_rmax(ka_s1, kd_s1)
+  cat(sprintf("  Stage 1: ka=%.3e  kd=%.5f  Rmax[1..%d]: %s\n",
+              ka_s1, kd_s1, n_cycles,
+              paste(sprintf("%.1f", Rmax_s1), collapse = ", ")))
+
+  # ── Stage 2: nls.lm full-vector refinement ────────────────────────────────
+  # Parameter layout: p[1]=ka, p[2]=kd, p[3..n_cycles+2]=Rmax_1..Rmax_N
+  # Use positional indexing for robustness (nls.lm preserves names, but
+  # explicit positional access avoids any potential environment capture issues).
+  par_names <- c("ka", "kd", paste0("Rmax_", seq_len(n_cycles)))
+  p0 <- setNames(c(ka_s1, kd_s1, unname(Rmax_s1)), par_names)
+
+  resid_fn2 <- function(p) {
+    ka <- p[1]; kd <- p[2]   # positional for robustness
+    resids <- c()
+    for (n in seq_len(n_cycles)) {
+      Rmax_n <- max(p[n + 2L], 1e-6)
+      f_n    <- make_f(ka, kd, n)
+      Y_n    <- Y_list[[n]]
+      valid  <- !is.na(f_n) & !is.na(Y_n)
+      resids <- c(resids, Y_n[valid] - Rmax_n * f_n[valid])
+    }
+    resids
+  }
+
+  lb <- setNames(c(1, 1e-6, rep(0.01, n_cycles)), par_names)
+  ub <- setNames(c(Inf, Inf, rep(Inf, n_cycles)),  par_names)
+
+  fit <- tryCatch(
+    minpack.lm::nls.lm(
+      par     = p0,
+      fn      = resid_fn2,
+      lower   = lb,
+      upper   = ub,
+      control = minpack.lm::nls.lm.control(maxiter = 2000, ftol = 1e-14, ptol = 1e-14)
+    ),
+    error = function(e) {
+      message("  [Warning] Stage 2 nls.lm failed: ", conditionMessage(e),
+              "\n  Falling back to Stage 1 result.")
+      NULL
+    }
+  )
+
+  if (is.null(fit)) {
+    p          <- p0
+    rss        <- varpro_rss(c(log(ka_s1), log(kd_s1)))
+    converged  <- FALSE
+    hessian_m  <- NULL
+  } else {
+    p          <- fit$par
+    rss        <- sum(fit$fvec^2)
+    converged  <- fit$info %in% 1:4
+    hessian_m  <- fit$hessian
+  }
+
+  ka     <- p[1]; kd <- p[2]
+  Rmax_v <- unname(p[3:(n_cycles + 2L)])
+  KD     <- kd / ka
+
+  # ── SE from Gauss-Newton Hessian ────────────────────────────────────────────
+  n_par  <- length(p)
+  n_obs  <- if (!is.null(fit)) length(fit$fvec) else
+    length(resid_fn2(p0))
+  sigma2 <- rss / max(n_obs - n_par, 1L)
+
+  se_params <- if (!is.null(hessian_m)) {
+    tryCatch({
+      h    <- hessian_m
+      sc   <- sqrt(pmax(diag(h), .Machine$double.eps))
+      h_sc <- h / outer(sc, sc)
+      cov_m <- sigma2 * solve(h_sc) / outer(sc, sc)
+      sqrt(pmax(diag(cov_m), 0))
+    }, error = function(e) {
+      tryCatch({
+        svd_h <- svd(hessian_m)
+        tol   <- max(svd_h$d) * .Machine$double.eps * n_par * 1e4
+        inv_d <- ifelse(svd_h$d > tol, 1 / svd_h$d, 0)
+        cov_m <- sigma2 * (svd_h$v %*% diag(inv_d) %*% t(svd_h$u))
+        sqrt(pmax(diag(cov_m), 0))
+      }, error = function(e2) {
+        message("  [Warning] SE computation failed: ", conditionMessage(e2))
+        rep(NA_real_, n_par)
+      })
+    })
+  } else {
+    rep(NA_real_, n_par)
+  }
+  names(se_params) <- names(p)
+
+  R_pred_list <- lapply(seq_len(n_cycles), function(n) Rmax_v[n] * make_f(ka, kd, n))
+
+  list(
+    ka             = ka,
+    kd             = kd,
+    KD             = KD,
+    KD_nM          = KD * 1e9,
+    Rmax_per_cycle = Rmax_v,
+    Rmax_mean      = mean(Rmax_v),
+    Rmax_sd        = sd(Rmax_v),
+    se             = se_params,
+    SE_ka          = se_params[["ka"]],
+    SE_kd          = se_params[["kd"]],
+    converged      = converged,
+    rss            = rss,
+    tt             = tt,
+    Y_list         = Y_list,
+    R_pred_list    = R_pred_list
+  )
+}
+
+# ── Plot: Carterra-style fit — full sensorgram + cycles 1–3 zoom panel ────────
+# Returns a patchwork of two panels stacked vertically (2:1 height ratio).
+plot_carterra_fit <- function(gfit, conc_M, tass, tdiss) {
+  n_cycles <- length(conc_M)
+  conc_nM  <- round(conc_M * 1e9, 3)
+
+  df_long <- do.call(rbind, lapply(seq_len(n_cycles), function(n) {
+    data.frame(
+      Time     = gfit$tt,
+      Response = gfit$Y_list[[n]],
+      Fit      = replace(gfit$R_pred_list[[n]], is.na(gfit$R_pred_list[[n]]), NA),
+      Cycle    = factor(paste0(conc_nM[n], " nM"), levels = paste0(conc_nM, " nM"))
+    )
+  }))
+
+  cols <- rep_len(PALETTE, n_cycles)
+  names(cols) <- levels(df_long$Cycle)
+
+  ann_lines <- data.frame(x = c(tass, tdiss))
+
+  subtitle_txt <- sprintf(
+    "ka = %.3e M\u207b\u00b9s\u207b\u00b9 | kd = %.5f s\u207b\u00b9 | K\u1d05 = %.2f nM | Rmax = %.2f \u00b1 %.2f RU | RSS = %.2f",
+    gfit$ka, gfit$kd, gfit$KD_nM, gfit$Rmax_mean, gfit$Rmax_sd, gfit$rss
+  )
+
+  base_layers <- list(
+    geom_vline(data = ann_lines, aes(xintercept = x),
+               colour = "grey60", linewidth = 0.4),
+    geom_point(aes(y = Response, colour = Cycle), size = 0.4, alpha = 0.35, shape = 16),
+    geom_line(aes(y = Fit, colour = Cycle), linewidth = 0.9, na.rm = TRUE),
+    scale_colour_manual(values = cols),
+    theme_minimal(base_size = 11),
+    theme(panel.grid.minor = element_blank(),
+          panel.border     = element_rect(colour = "grey80", fill = NA),
+          legend.position  = "right",
+          legend.key.size  = unit(0.5, "lines"))
+  )
+
+  p_full <- ggplot(df_long, aes(x = Time)) +
+    base_layers +
+    labs(
+      title    = "Carterra-style fit \u2014 global ka + kd, per-cycle Rmax",
+      subtitle = subtitle_txt,
+      x = "Time (s)", y = "Response (RU)", colour = "Conc.",
+      caption  = "Grey verticals: tass / tdiss  |  Baseline-corrected MCK format"
+    ) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 7.5, colour = "grey30"),
+      plot.caption  = element_text(size = 7.5, colour = "grey50")
+    )
+
+  # ── Zoom panel: first 3 cycles ─────────────────────────────────────────────
+  n_z     <- min(3L, n_cycles)
+  lvls_z  <- levels(df_long$Cycle)[1:n_z]
+  df_zoom <- df_long[df_long$Cycle %in% lvls_z, ]
+  df_zoom$Cycle <- droplevels(df_zoom$Cycle)
+  cols_z  <- cols[lvls_z]
+
+  zoom_pts <- df_zoom$Response[df_zoom$Time <= tdiss + 120]
+  y_max_z  <- max(zoom_pts, na.rm = TRUE)
+
+  p_zoom <- ggplot(df_zoom, aes(x = Time)) +
+    geom_vline(data = ann_lines, aes(xintercept = x),
+               colour = "grey60", linewidth = 0.4) +
+    geom_point(aes(y = Response, colour = Cycle), size = 0.7, alpha = 0.5, shape = 16) +
+    geom_line(aes(y = Fit, colour = Cycle), linewidth = 0.9, na.rm = TRUE) +
+    scale_colour_manual(values = cols_z) +
+    coord_cartesian(xlim = c(0, tdiss + 120), ylim = c(0, y_max_z * 1.1)) +
     labs(
       title  = "Zoom: lowest 3 concentrations",
       x = "Time (s)", y = "Response (RU)", colour = "Conc."
